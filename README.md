@@ -9,6 +9,6 @@ python onionmail_accounts.py --mode tor --browser=chrome --headless=true --steal
 
 And here for terabox_accounts.py, its basically just the same thing with diffrent values for accounts and threads: 
 
-python terabox_accounts.py --mode=tor --browser=firefox --headless=false --stealth=true --accounts=10 --concurrency=2
+python terabox_accounts.py --mode=tor --browser=chrome --headless=false --stealth=true --accounts=10 --concurrency=2
 
 It is kinda fun to watch terabox_accounts.py creating accounts, onionmail_accounts.py is more boring on that note, but you can run both of them headless and everything works find, and i would even recommend doing that.
