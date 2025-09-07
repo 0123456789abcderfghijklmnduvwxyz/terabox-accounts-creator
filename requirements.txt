@@ -1,0 +1,18 @@
+# Core dependencies
+playwright>=1.55.0
+playwright-stealth>=2.0.0
+
+# Captcha OCR
+pillow>=10.0.0
+pytesseract>=0.3.10
+
+# Optional GUI detection (screen size)
+tk
+
+# For Tor / proxy support, nothing extra is strictly required,
+# but on Windows you may want pysocks (Playwright can use socks5:// without it, though)
+pysocks
+
+# Standard library modules (no need to install):
+# argparse, os, re, sys, time, math, threading, secrets, string,
+# socket, dataclasses, typing, urllib.parse, contextlib, base64
