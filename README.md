@@ -5,7 +5,7 @@ just install all the dependecies, install tor, if you are on linux start the tor
 
 Here are some example arguments you can run the script with, here first for onionmail_accounts.py: 
 
-python onionmail_accounts.py --mode tor --browser=chrome --headless=true --stealth=true --accounts=50 --threads=5
+python onionmail_creator.py --mode tor --browser=chrome --headless=true --stealth=true --accounts=50 --threads=5
 
 And here for terabox_accounts.py, its basically just the same thing with diffrent values for accounts and threads: 
 
