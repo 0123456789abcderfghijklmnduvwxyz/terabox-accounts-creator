@@ -13,6 +13,9 @@ from typing import Optional, Tuple, List, Dict
 from urllib.parse import urlparse
 from contextlib import suppress
 import base64
+from io import BytesIO
+from PIL import Image
+import easyocr
 
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError, Error as PWError
 
@@ -29,44 +32,222 @@ PROXIES_FILE = "proxies.txt"
 accounts_lock = threading.Lock()
 output_lock = threading.Lock()
 print_lock = threading.Lock()  # keep log lines tidy
+reader = easyocr.Reader(['en'], gpu=False)
 
 # ====================== Solve Captcha's cause their captcha's are shit and can be solved with a 14KB library ========================================== #
 
-def solve_simple_verify_captcha(page, worker_slot: int, acct_idx: Optional[int] = None, max_attempts: int = 20) -> bool:
+import base64
+from io import BytesIO
+from PIL import Image, ImageOps, ImageFilter
+import numpy as np
+import easyocr
+import re
+import time
+from contextlib import suppress
+
+# Reader global initialisieren (nur einmal!)
+reader = easyocr.Reader(['en'], gpu=False)
+
+def _bytes_to_pil(b: bytes) -> Image.Image:
+    return Image.open(BytesIO(b)).convert("RGBA")
+
+def _pil_preprocess(img: Image.Image, scale: int = 2, do_threshold: bool = True) -> Image.Image:
+    """Vorverarbeitung: Graustufen, Resize, Autocontrast, Threshold, Glättung"""
+    g = img.convert("L")
+    w, h = g.size
+    g = g.resize((max(32, w * scale), max(32, h * scale)), resample=Image.BILINEAR)
+    g = ImageOps.autocontrast(g)
+    g = g.filter(ImageFilter.MedianFilter(size=3))
+    if do_threshold:
+        hist = g.histogram()
+        pixels = sum(i * hist[i] for i in range(256))
+        total = sum(hist) or 1
+        mean = pixels // total
+        thresh = int(max(100, min(200, mean)))
+        g = g.point(lambda p: 255 if p > thresh else 0)
+    return g
+
+def _easyocr_read(img_pil: Image.Image):
+    """
+    OCR mit EasyOCR, optimiert für 4 Zeichen [A-Z0-9]
+    """
+    # PIL → numpy
+    img_np = np.array(img_pil)
+
+    # EasyOCR erkennt Textbereiche
+    results = reader.readtext(img_np, detail=0, allowlist="ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+
+    if not results:
+        return None
+
+    # Ergebnisse kombinieren, filtern
+    text = "".join(results).strip().upper()
+    if re.fullmatch(r"[A-Z0-9]{4}", text):
+        return text
+    return None
+    
+def extract_captcha_image_bytes(page, selector_candidates=None) -> bytes | None:
+    sel_cands = selector_candidates or ["canvas", "#canvas", "#captcha-img", "img.captcha", "img"]
+
+    # 1) Canvas → toDataURL
+    try:
+        handle = page.query_selector("canvas")
+        if handle:
+            img_base64 = page.evaluate(
+                """
+                (cnv) => {
+                    var tmp = document.createElement('canvas');
+                    tmp.width = cnv.width;
+                    tmp.height = cnv.height;
+                    tmp.getContext('2d').drawImage(cnv, 0, 0);
+                    return tmp.toDataURL('image/png').substring(22);
+                }
+                """,
+                handle
+            )
+            if img_base64:
+                return base64.b64decode(img_base64)
+    except Exception:
+        pass
+
+    # 2) img[src^=data]
+    for sel in sel_cands:
+        try:
+            src = page.evaluate("sel => { const el = document.querySelector(sel); return el ? el.src : null; }", sel)
+            if src and src.startswith("data:"):
+                header, b64 = src.split(",", 1)
+                return base64.b64decode(b64)
+        except Exception:
+            pass
+
+    # 3) fetch(src)
+    for sel in sel_cands:
+        try:
+            src = page.evaluate("sel => { const el = document.querySelector(sel); return el ? el.src : null; }", sel)
+            if src and not src.startswith("data:"):
+                b64 = page.evaluate(
+                    """(url) => fetch(url).then(r => r.arrayBuffer()).then(b => {
+                        const u8 = new Uint8Array(b);
+                        let bin = '';
+                        for (let i=0;i<u8.length;i++){ bin += String.fromCharCode(u8[i]); }
+                        return btoa(bin);
+                    }).catch(e => null)""",
+                    src
+                )
+                if b64:
+                    return base64.b64decode(b64)
+        except Exception:
+            pass
+
+    # 4) Screenshot des Elements
+    for sel in sel_cands:
+        try:
+            loc = page.locator(sel)
+            if loc.count() > 0:
+                return loc.first.screenshot()
+        except Exception:
+            pass
+
+    # 5) Screenshot Ausschnitt
+    for sel in sel_cands:
+        try:
+            loc = page.locator(sel)
+            if loc.count() > 0:
+                box = loc.first.bounding_box()
+                if box:
+                    return page.screenshot(clip={"x": box["x"], "y": box["y"], "width": box["width"], "height": box["height"]})
+        except Exception:
+            pass
+
+    return None
+
+def fill_captcha_and_confirm(page, guess: str) -> bool:
+    """inputs captcha and presses the confirm button"""
+    filled = False
+
+    try:
+        page.fill("#input", guess)
+        filled = True
+    except Exception as e:
+        log(f"Konnte Input #input nicht füllen: {e}")
+        return False
+
+    clicked = False
+    try:
+        page.get_by_role("button", name="Confirm").click(timeout=3000)
+        clicked = True
+    except Exception:
+        btn_selectors = ['button:has-text("Confirm")', 'button:has-text("OK")', 'button:has-text("Verify")']
+        for bsel in btn_selectors:
+            try:
+                if click_if_visible(page.locator(bsel), timeout=2000, force=True):
+                    clicked = True
+                    break
+            except Exception:
+                pass
+
+    return filled and clicked
+
+def solve_simple_verify_captcha(page, worker_slot: int, acct_idx: int = None, max_attempts: int = 20) -> bool:
+    """Captcha-Solver mit Tesseract (immer 4 Zeichen, [A-Z0-9])"""
     attempts = 0
+    sel_cands = ["canvas", "#canvas", "#captcha-img", "img.captcha", "img"]
+    print("Got a Captcha.")
+
     while attempts < max_attempts:
         attempts += 1
+        log(f"[Captcha attempt {attempts}/{max_attempts}]", acct_idx=acct_idx, worker_slot=worker_slot)
+
+        img_bytes = extract_captcha_image_bytes(page, sel_cands)
+        if not img_bytes:
+            log("No Captcha-image extracted, reload...", acct_idx=acct_idx, worker_slot=worker_slot)
+            page.reload(wait_until="domcontentloaded", timeout=10000)
+            time.sleep(1)
+            continue
+
+        pil = _bytes_to_pil(img_bytes)
+
+        variants = [
+            _pil_preprocess(pil, scale=2, do_threshold=True),
+            _pil_preprocess(pil, scale=3, do_threshold=False),
+            ImageOps.autocontrast(pil.convert("L").resize((pil.size[0]*2, pil.size[1]*2)))
+        ]
+
+        guess = None
+        for var in variants:
+            guess = _easyocr_read(var)
+            if guess:
+                break
+
+        if not guess:
+            log("OCR couldnt find a valid Code, reload...", acct_idx=acct_idx, worker_slot=worker_slot)
+            page.reload(wait_until="domcontentloaded", timeout=10000)
+            time.sleep(1)
+            continue
+
+        log(f"OCR guess: '{guess}'", acct_idx=acct_idx, worker_slot=worker_slot)
+
+        fill_captcha_and_confirm(page, guess)
+        time.sleep(1.5)
+
         try:
-            log(f"[Captcha attempt {attempts}/{max_attempts}]", acct_idx=acct_idx, worker_slot=worker_slot)
-            img_bytes = grab_canvas_image(page, "#canvas")
-            if not img_bytes:
-                log("Could not extract canvas image; retrying...", acct_idx=acct_idx, worker_slot=worker_slot)
-            else:
-                img = Image.open(BytesIO(img_bytes)).convert("L")
-                guess = pytesseract.image_to_string(
-                    img,
-                    config="--psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-                ).strip()
-                guess = "".join(ch for ch in guess if ch.isalnum())
-                if guess:
-                    log(f"Guessed captcha code: {guess}", acct_idx=acct_idx, worker_slot=worker_slot)
-                    page.locator("#input").fill(guess)
-                    page.get_by_role("button", name="Confirm").click()
-                    page.wait_for_timeout(2000)
-                    if not page.url.startswith("https://www.terabox.com/simple-verify"):
-                        log("Captcha solved; leaving verification page.", acct_idx=acct_idx, worker_slot=worker_slot)
-                        return True
-                else:
-                    log("OCR guess empty; refreshing captcha...", acct_idx=acct_idx, worker_slot=worker_slot)
-            with suppress(Exception):
-                page.reload()
-                page.wait_for_load_state("domcontentloaded", timeout=10000)
-        except Exception as e:
-            log(f"Captcha attempt failed: {e}", acct_idx=acct_idx, worker_slot=worker_slot)
-            with suppress(Exception):
-                page.reload()
-                page.wait_for_load_state("domcontentloaded", timeout=10000)
-    log("Failed to solve captcha after max attempts.", acct_idx=acct_idx, worker_slot=worker_slot)
+            if not page.url.startswith("https://www.terabox.com/simple-verify"):
+                log("Captcha solved (URL changed). Took {attempts} attempts", acct_idx=acct_idx, worker_slot=worker_slot)
+                return True
+        except Exception:
+            pass
+
+        still_here = any(page.locator(s).count() > 0 for s in sel_cands)
+        if not still_here:
+            log("Captcha disapperd, solved.", acct_idx=acct_idx, worker_slot=worker_slot)
+            return True
+
+        log("Captcha not accepted, retry...", acct_idx=acct_idx, worker_slot=worker_slot)
+        with suppress(Exception):
+            page.reload(wait_until="domcontentloaded", timeout=10000)
+        time.sleep(1)
+
+    log("Captcha couldnt be solved.", acct_idx=acct_idx, worker_slot=worker_slot)
     return False
 
 # ------------------------------- Logging ---------------------------------- #
@@ -105,29 +286,48 @@ account_counter_lock = threading.Lock()
 
 def pop_onion_account(path: str) -> Tuple[str, str, int]:
     """
-    Pops the first username:password line from onionmail_accounts.txt,
-    rewrites the file without that line, and returns (username, password, sequential_index).
-    The returned sequential_index is an incrementing counter so we can tag logs like [#003 W01].
+    Holt den nächsten unbenutzten username:password aus onionmail_accounts.txt.
+    Prüft gegen used_terabox_emails.txt und protokolliert dort die genutzten Accounts.
     """
     global account_counter
     with accounts_lock:
         if not os.path.exists(path):
             raise FileNotFoundError(f"{path} not found")
+
+        # Alle möglichen Accounts laden
         with open(path, "r", encoding="utf-8") as f:
             lines = [ln.strip() for ln in f if ln.strip()]
         if not lines:
             raise RuntimeError("No accounts left in onionmail_accounts.txt")
-        first = lines.pop(0)
-        parts = first.split(":", 1)
-        if len(parts) != 2:
-            raise ValueError(f"Invalid line: '{first}' (expected username:password)")
-        with open(path, "w", encoding="utf-8") as f:
-            for ln in lines:
-                f.write(ln + "\n")
-        username, pwd = parts[0].strip(), parts[1].strip()
+
+        # Bereits benutzte Mails laden
+        used = set()
+        if os.path.exists("used_terabox_emails.txt"):
+            with open("used_terabox_emails.txt", "r", encoding="utf-8") as f:
+                used = {ln.strip().lower() for ln in f if ln.strip()}
+
+        # Nächsten unbenutzten Account finden
+        username, pwd = None, None
+        for entry in lines:
+            parts = entry.split(":", 1)
+            if len(parts) != 2:
+                continue
+            u, p = parts[0].strip(), parts[1].strip()
+            email = f"{u}@onionmail.org".lower()
+            if email not in used:
+                username, pwd = u, p
+                # sofort als benutzt markieren
+                with open("used_terabox_emails.txt", "a", encoding="utf-8") as f:
+                    f.write(email + "\n")
+                break
+
+        if not username:
+            raise RuntimeError("No unused accounts left in onionmail_accounts.txt")
+
     with account_counter_lock:
         account_counter += 1
         idx = account_counter
+
     return username, pwd, idx
 
 def save_terabox_credentials(email: str, password: str):
