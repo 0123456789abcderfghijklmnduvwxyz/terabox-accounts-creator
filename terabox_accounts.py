@@ -34,7 +34,7 @@ output_lock = threading.Lock()
 print_lock = threading.Lock()  # keep log lines tidy
 reader = easyocr.Reader(['en'], gpu=False)
 
-# ====================== Solve Captcha's cause their captcha's are shit and can be solved with a 14KB library ========================================== #
+# ====================== Solve Captcha's cause for some reason they are too lazy to do it correct and you can just read the code from a variable, conviniently called "code", if it fails it goes the hard way by just reading it, which will take a few attempts. ========================================== #
 
 import base64
 from io import BytesIO
@@ -189,66 +189,41 @@ def fill_captcha_and_confirm(page, guess: str) -> bool:
     return filled and clicked
 
 def solve_simple_verify_captcha(page, worker_slot: int, acct_idx: int = None, max_attempts: int = 20) -> bool:
-    """Captcha-Solver mit Tesseract (immer 4 Zeichen, [A-Z0-9])"""
-    attempts = 0
-    sel_cands = ["canvas", "#canvas", "#captcha-img", "img.captcha", "img"]
-    print("Got a Captcha.")
+    """Captcha-Solver using ONLY direct access to JS variable `code`, with retries"""
+    log("Got a Captcha (direct variable read).", acct_idx=acct_idx, worker_slot=worker_slot)
 
-    while attempts < max_attempts:
-        attempts += 1
-        log(f"[Captcha attempt {attempts}/{max_attempts}]", acct_idx=acct_idx, worker_slot=worker_slot)
-
-        img_bytes = extract_captcha_image_bytes(page, sel_cands)
-        if not img_bytes:
-            log("No Captcha-image extracted, reload...", acct_idx=acct_idx, worker_slot=worker_slot)
-            page.reload(wait_until="domcontentloaded", timeout=10000)
-            time.sleep(1)
-            continue
-
-        pil = _bytes_to_pil(img_bytes)
-
-        variants = [
-            _pil_preprocess(pil, scale=2, do_threshold=True),
-            _pil_preprocess(pil, scale=3, do_threshold=False),
-            ImageOps.autocontrast(pil.convert("L").resize((pil.size[0]*2, pil.size[1]*2)))
-        ]
-
-        guess = None
-        for var in variants:
-            guess = _easyocr_read(var)
-            if guess:
-                break
-
-        if not guess:
-            log("OCR couldnt find a valid Code, reload...", acct_idx=acct_idx, worker_slot=worker_slot)
-            page.reload(wait_until="domcontentloaded", timeout=10000)
-            time.sleep(1)
-            continue
-
-        log(f"OCR guess: '{guess}'", acct_idx=acct_idx, worker_slot=worker_slot)
-
-        fill_captcha_and_confirm(page, guess)
-        time.sleep(1.5)
-
+    for attempt in range(1, max_attempts + 1):
         try:
+            # Read captcha directly from JS variable
+            code = page.evaluate("() => window.code")
+            if not code:
+                log(f"[Attempt {attempt}] Could not read captcha variable.", acct_idx=acct_idx, worker_slot=worker_slot)
+                continue
+
+            log(f"[Attempt {attempt}] JS captcha code: '{code}'", acct_idx=acct_idx, worker_slot=worker_slot)
+
+            # Fill the captcha input and confirm
+            fill_captcha_and_confirm(page, code)
+            time.sleep(1.5)
+
+            # Verify captcha solved
             if not page.url.startswith("https://www.terabox.com/simple-verify"):
-                log("Captcha solved (URL changed). Took {attempts} attempts", acct_idx=acct_idx, worker_slot=worker_slot)
+                log("Captcha solved via JS variable (URL changed).", acct_idx=acct_idx, worker_slot=worker_slot)
                 return True
-        except Exception:
-            pass
 
-        still_here = any(page.locator(s).count() > 0 for s in sel_cands)
-        if not still_here:
-            log("Captcha disapperd, solved.", acct_idx=acct_idx, worker_slot=worker_slot)
-            return True
+            still_here = page.locator("#canvas").count() > 0
+            if not still_here:
+                log("Captcha disappeared, solved.", acct_idx=acct_idx, worker_slot=worker_slot)
+                return True
 
-        log("Captcha not accepted, retry...", acct_idx=acct_idx, worker_slot=worker_slot)
-        with suppress(Exception):
-            page.reload(wait_until="domcontentloaded", timeout=10000)
-        time.sleep(1)
+            log(f"[Attempt {attempt}] Captcha not accepted, retrying...", acct_idx=acct_idx, worker_slot=worker_slot)
 
-    log("Captcha couldnt be solved.", acct_idx=acct_idx, worker_slot=worker_slot)
+        except Exception as e:
+            log(f"[Attempt {attempt}] Error while reading captcha variable: {e}", acct_idx=acct_idx, worker_slot=worker_slot)
+
+    log(f"Failed to solve captcha after {max_attempts} attempts.", acct_idx=acct_idx, worker_slot=worker_slot)
     return False
+
 
 # ------------------------------- Logging ---------------------------------- #
 
@@ -271,7 +246,6 @@ def log(msg: str, acct_idx: Optional[int] = None, worker_slot: Optional[int] = N
         else:
             prefix = "[MAIN]"
         print(f"{prefix} {msg}", flush=True)
-
 
 # ----------------------------- File helpers ------------------------------- #
 
@@ -729,6 +703,35 @@ def create_one_account(worker_slot: int, cfg: Config, window_rect: Tuple[int, in
         )
         context.set_default_timeout(45000)
 
+        # Block unnecessary resources to save bandwidth
+        def block_unneeded(route, request):
+            url = request.url.lower()
+            rtype = request.resource_type
+
+            # Block resource types that are just visual/heavy
+            if rtype in ["image", "font", "media", "other", "texttrack", "imageset"]:
+                return route.abort()
+
+            # Block known 3rd party scripts we don’t need
+            if any(bad in url for bad in [
+                "facebook", "kakao", "apple", "google-analytics", "doubleclick",
+                "googletag", "ads", "abclite", "adzerk", "analytics", "cdn.api.twitter",
+                "exelator", "fontawesome", "google", "googletagmanager",
+            ]):
+                return route.abort()
+
+            # Allow only terabox.com and onionmail.org + required cdn scripts
+            if not any(domain in url for domain in [
+                "terabox.com", "onionmail.org", "teraboxcdn.com"
+            ]):
+                return route.abort()
+
+            # Everything else continues
+            return route.continue_()
+
+
+        context.route("**/*", block_unneeded)
+
         # Monitoring
         def on_page_close(pg):
             log("Page closed", acct_idx=acct_idx, worker_slot=worker_slot)
@@ -744,7 +747,6 @@ def create_one_account(worker_slot: int, cfg: Config, window_rect: Tuple[int, in
         if not cfg.headless:
             page_tera.bring_to_front()
 
-        # ---- REPLACED: use the exact recorder steps you provided for the initial TeraBox flow ----
         log("Opening TeraBox (recorder sequence) ...", acct_idx=acct_idx, worker_slot=worker_slot)
         page_tera.goto("https://www.terabox.com/", wait_until="domcontentloaded", timeout=60000)
 
@@ -755,11 +757,10 @@ def create_one_account(worker_slot: int, cfg: Config, window_rect: Tuple[int, in
             if not solved:
                 raise RuntimeError("Could not solve captcha on simple-verify page after multiple attempts.")
 
-        # Use your recorded commands exactly (wrapped in suppress to avoid failures halting the script)
+        # Use your recorded commands exactly
         with suppress(Exception):
             page_tera.get_by_role("button", name="Get Started").first.click()
         with suppress(Exception):
-            # recorded: page.locator("span").filter(has_text="Sign up").click()
             page_tera.locator("span").filter(has_text="Sign up").click()
         with suppress(Exception):
             page_tera.locator(".other-item > div:nth-child(2)").click()
@@ -769,9 +770,6 @@ def create_one_account(worker_slot: int, cfg: Config, window_rect: Tuple[int, in
             page_tera.get_by_role("textbox", name="Enter your email").fill(email)
         with suppress(Exception):
             page_tera.get_by_text("Continue").click()
-
-        # Keep TeraBox tab open (we'll switch to OnionMail)
-        # ------------------------------------------------------------------------------------------
 
         # OnionMail tab
         page_onion = context.new_page()
@@ -785,14 +783,12 @@ def create_one_account(worker_slot: int, cfg: Config, window_rect: Tuple[int, in
         log("Opening OnionMail login...", acct_idx=acct_idx, worker_slot=worker_slot)
         page_onion.goto("https://onionmail.org/account/login", wait_until="domcontentloaded", timeout=60000)
 
-        # Fill onionmail credentials (from onionmail_accounts.txt)
-        # The file format expected is: username:password
         page_onion.locator("#username").wait_for(state="visible", timeout=30000)
         page_onion.locator("#username").fill(username)
         page_onion.locator("#password").fill(onion_pwd)
         page_onion.locator(".btn-success").first.click()
 
-        # Interleaved: wait for TeraBox prompt, while polling OnionMail for code
+        # Interleaved: wait for TeraBox prompt + poll OnionMail for code
         if not cfg.headless:
             page_tera.bring_to_front()
         log("Waiting for TeraBox prompt and polling OnionMail for verification email...", acct_idx=acct_idx, worker_slot=worker_slot)
@@ -804,48 +800,35 @@ def create_one_account(worker_slot: int, cfg: Config, window_rect: Tuple[int, in
         if not code:
             raise TimeoutError("Verification email not found on onionmail.org within timeout")
 
-        # Fill verification code into TeraBox using the recorder-esque per-textbox fills you used
         if not cfg.headless:
             page_tera.bring_to_front()
         log(f"Entering verification code (per-box): {code}", acct_idx=acct_idx, worker_slot=worker_slot)
 
-        # Use the exact style you wanted: fill each visible textbox (first..nth)
         try:
-            # wait briefly for the inputs to appear
             page_tera.get_by_role("textbox").first.wait_for(state="visible", timeout=5000)
         except Exception:
             pass
 
-        # Ensure we have 4 digits
         if len(code) >= 4:
-            with suppress(Exception):
-                page_tera.get_by_role("textbox").first.fill(code[0])
-            with suppress(Exception):
-                page_tera.get_by_role("textbox").nth(1).fill(code[1])
-            with suppress(Exception):
-                page_tera.get_by_role("textbox").nth(2).fill(code[2])
-            with suppress(Exception):
-                page_tera.get_by_role("textbox").nth(3).fill(code[3])
+            with suppress(Exception): page_tera.get_by_role("textbox").first.fill(code[0])
+            with suppress(Exception): page_tera.get_by_role("textbox").nth(1).fill(code[1])
+            with suppress(Exception): page_tera.get_by_role("textbox").nth(2).fill(code[2])
+            with suppress(Exception): page_tera.get_by_role("textbox").nth(3).fill(code[3])
         else:
-            # Fallback to robust filling function
             fill_verification_code(page_tera, code)
 
-        # Click the visual confirm element if present (your recorder used .i-look)
         with suppress(Exception):
             page_tera.locator(".i-look").click()
 
-        # Wait for password field and fill a secure password (12+ chars, contains uppercase and digit)
         password = generate_password(min_len=12)
         log(f"Generated password: {password}", acct_idx=acct_idx, worker_slot=worker_slot)
 
-        # Use recorder-style fill if present
         filled_pw = False
         with suppress(Exception):
             page_tera.get_by_role("textbox", name="Enter your password").click()
             page_tera.get_by_role("textbox", name="Enter your password").fill(password)
             filled_pw = True
 
-        # Fallback to original placeholder-based locator
         if not filled_pw:
             pw_input = page_tera.locator('input[placeholder="Enter your password"]')
             try:
@@ -855,13 +838,11 @@ def create_one_account(worker_slot: int, cfg: Config, window_rect: Tuple[int, in
                 with suppress(Exception):
                     page_tera.locator('input[placeholder*="password"]').first.fill(password)
 
-        # Click Create account (recorder style)
         submitted = False
         with suppress(Exception):
             page_tera.get_by_text("Create account").click()
             submitted = True
 
-        # If recorder-style create didn't exist, fall back to previous submit candidates
         if not submitted:
             submit_candidates = [
                 'button:has-text("Sign up")',
@@ -876,20 +857,17 @@ def create_one_account(worker_slot: int, cfg: Config, window_rect: Tuple[int, in
                     break
             if not submitted:
                 with suppress(Exception):
-                    # final fallback: press Enter in password input
                     try:
                         page_tera.keyboard.press("Enter")
                     except Exception:
                         pass
 
-        # Wait for URL change, then 5 seconds, then close
         old_url = page_tera.url
         log("Waiting for URL change after submission...", acct_idx=acct_idx, worker_slot=worker_slot)
         changed = wait_for_url_change(page_tera, old_url, timeout=120000)
         if not changed:
             log("URL did not change within timeout; proceeding to close anyway.", acct_idx=acct_idx, worker_slot=worker_slot)
         else:
-            # Save credentials only if URL changed (likely success)
             save_terabox_credentials(email, password)
 
         log("Finalizing; waiting 5 seconds...", acct_idx=acct_idx, worker_slot=worker_slot)
@@ -904,7 +882,6 @@ def create_one_account(worker_slot: int, cfg: Config, window_rect: Tuple[int, in
                 browser.close()
 
     log(f"Completed task for: {email}", acct_idx=acct_idx, worker_slot=worker_slot)
-
 
 # --------------------------------- Main ----------------------------------- #
 
